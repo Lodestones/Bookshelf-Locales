@@ -1,0 +1,60 @@
+package gg.lode.bookshelflocales.source;
+
+import java.io.BufferedReader;
+import java.io.IOException;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.util.LinkedHashMap;
+import java.util.Map;
+import java.util.function.Consumer;
+import java.util.stream.Stream;
+
+/**
+ * Every {@code *.json} in a folder, with the file name (minus extension) as the language code.
+ *
+ * <p>This is the server owner's side of the system: they drop {@code fr_fr.json} into the folder and
+ * that locale exists, no developer change needed. Because a folder source is normally registered
+ * last, a key present here overrides the same key in the developer's bundled defaults, and keys the
+ * owner didn't write still fall back to those defaults.
+ */
+public final class FolderLocaleSource implements LocaleSource {
+
+    private final Path folder;
+
+    public FolderLocaleSource(Path folder) {
+        this.folder = folder;
+    }
+
+    public Path folder() {
+        return folder;
+    }
+
+    @Override
+    public Map<String, Map<String, String>> load(Consumer<String> problems) {
+        Map<String, Map<String, String>> loaded = new LinkedHashMap<>();
+        if (!Files.isDirectory(folder)) return loaded;
+
+        try (Stream<Path> files = Files.list(folder)) {
+            files.filter(path -> path.getFileName().toString().toLowerCase().endsWith(".json"))
+                    .sorted()
+                    .forEach(path -> {
+                        String name = path.getFileName().toString();
+                        String languageCode = name.substring(0, name.length() - ".json".length()).toLowerCase();
+                        try (BufferedReader reader = Files.newBufferedReader(path, StandardCharsets.UTF_8)) {
+                            loaded.put(languageCode, LocaleJson.parse(reader));
+                        } catch (Exception e) {
+                            problems.accept("Could not read locale file " + name + ": " + e.getMessage());
+                        }
+                    });
+        } catch (IOException e) {
+            problems.accept("Could not list locale folder " + folder + ": " + e.getMessage());
+        }
+        return loaded;
+    }
+
+    @Override
+    public String describe() {
+        return "folder " + folder;
+    }
+}

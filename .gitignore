@@ -1,0 +1,5 @@
+dependency-reduced-pom.xml
+.idea
+.DS_Store
+Bookshelf-Locales.iml
+target
