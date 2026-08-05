@@ -1,2 +1,24 @@
-jdk:
-  - openjdk21
+# JitPack's `jdk: openjdk21` shorthand resolves to the sdkman candidate
+# `21.0.2-open`, which sdkman can no longer download:
+#
+#   Downloading: java 21.0.2-open
+#   Download has failed, aborting!
+#
+# The build then silently continues on the image's default Java 8, so every
+# build fails — Gradle with "JAVA_HOME is set to an invalid directory",
+# Maven with a release-version error. Nothing in the project is at fault,
+# which makes it a confusing one to chase.
+#
+# So install a Java 21 explicitly, trying candidates until one resolves.
+before_install:
+  - |
+    for candidate in 21.0.7-tem 21.0.5-tem 21.0.2-tem 21-open 21.0.2-open; do
+      if sdk install java "$candidate" < /dev/null; then
+        sdk use java "$candidate"
+        export JAVA_HOME="$HOME/.sdkman/candidates/java/$candidate"
+        echo "Using JAVA_HOME=$JAVA_HOME"
+        java -version
+        break
+      fi
+      echo "candidate $candidate unavailable, trying next"
+    done
