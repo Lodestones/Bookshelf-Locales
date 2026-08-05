@@ -25,4 +25,14 @@ public interface LocaleSource {
 
     /** Short human-readable name, used in load warnings. */
     String describe();
+
+    /**
+     * Whether loading this source goes over the network.
+     *
+     * <p>This is what separates {@code reloadFromDisk()} from {@code reloadFromCloud()}: a disk reload
+     * has to skip remote sources, or picking up an admin's file edit would also mean waiting on HTTP.
+     */
+    default boolean isRemote() {
+        return false;
+    }
 }

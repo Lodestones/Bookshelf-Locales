@@ -27,6 +27,7 @@ import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.function.Consumer;
+import java.util.function.Predicate;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
@@ -67,6 +68,13 @@ public final class LocaleManager implements LocaleService {
 
     /** Loaded translations, replaced wholesale on reload so a reader never sees a half-built map. */
     private volatile Map<String, Map<String, String>> locales = Map.of();
+    /**
+     * What each source returned the last time it was read, kept so a partial reload can re-merge
+     * against the sources it didn't touch instead of dropping them.
+     */
+    private final Map<LocaleSource, Map<String, Map<String, String>>> snapshots = new ConcurrentHashMap<>();
+    /** Serializes reloads — two at once would race on {@link #snapshots} and could publish a stale merge. */
+    private final Object reloadLock = new Object();
     /** Resolved (nested keys expanded, transformations applied) values, keyed {@code locale:key}. */
     private final Map<String, String> resolved = new ConcurrentHashMap<>();
 
@@ -90,29 +98,88 @@ public final class LocaleManager implements LocaleService {
 
     @Override
     public void reload() {
-        if (exportBundledDefaults) exportBundledDefaults();
+        reload(source -> true);
+    }
 
-        Map<String, Map<String, String>> merged = new LinkedHashMap<>();
-        for (LocaleSource source : sources) {
-            Map<String, Map<String, String>> loaded;
-            try {
-                loaded = source.load(problem -> logger.accept("[Locales] " + problem));
-            } catch (Exception e) {
-                // A source that throws outright still must not take the plugin down with it.
-                logger.accept("[Locales] Source " + source.describe() + " failed to load: " + e.getMessage());
-                continue;
-            }
-            loaded.forEach((languageCode, translations) ->
-                    merged.computeIfAbsent(languageCode.toLowerCase(), key -> new LinkedHashMap<>()).putAll(translations));
+    /**
+     * Re-reads only the local sources — bundled defaults, the server owner's folder, in-memory
+     * locales. Remote sources keep whatever they last returned, so an admin editing a file gets their
+     * change applied without a network round trip (and without the reload failing when the host is
+     * down).
+     */
+    @Override
+    public void reloadFromDisk() {
+        reload(source -> !source.isRemote());
+    }
+
+    /**
+     * Re-fetches only the remote (cloud-loader) sources, leaving files on disk alone. Blocks on HTTP —
+     * call {@link #reloadFromCloudAsync()} from anything latency-sensitive, like a command handler on
+     * the main thread.
+     */
+    @Override
+    public void reloadFromCloud() {
+        if (sources.stream().noneMatch(LocaleSource::isRemote)) {
+            logger.accept("[Locales] reloadFromCloud() had nothing to do: no remote source is configured");
+            return;
         }
+        reload(LocaleSource::isRemote);
+    }
 
-        this.locales = Collections.unmodifiableMap(merged);
-        this.resolved.clear();
+    /**
+     * Re-reads the sources {@code filter} accepts and re-merges them over the last result of the ones
+     * it doesn't, preserving the configured precedence either way.
+     */
+    public void reload(Predicate<LocaleSource> filter) {
+        synchronized (reloadLock) {
+            if (exportBundledDefaults && sources.stream().anyMatch(source -> !source.isRemote() && filter.test(source))) {
+                exportBundledDefaults();
+            }
+
+            for (LocaleSource source : sources) {
+                if (!filter.test(source)) continue;
+                try {
+                    Map<String, Map<String, String>> loaded = source.load(problem -> logger.accept("[Locales] " + problem));
+                    if (loaded.isEmpty() && !snapshots.getOrDefault(source, Map.of()).isEmpty()) {
+                        // The source went from having locales to having none — an unreachable host with no
+                        // cache, or a folder that just got emptied. Keeping the last good copy is always
+                        // better than dropping to raw keys, and the warning above says why it's stale.
+                        logger.accept("[Locales] Source " + source.describe() + " returned nothing; keeping the previous copy");
+                        continue;
+                    }
+                    snapshots.put(source, loaded);
+                } catch (Exception e) {
+                    // A source that throws outright still must not take the plugin down with it — nor
+                    // discard what it gave us last time.
+                    logger.accept("[Locales] Source " + source.describe() + " failed to load: " + e.getMessage());
+                }
+            }
+
+            // Merged in configured order every time, so a partial reload can't reshuffle precedence.
+            Map<String, Map<String, String>> merged = new LinkedHashMap<>();
+            for (LocaleSource source : sources) {
+                snapshots.getOrDefault(source, Map.of()).forEach((languageCode, translations) ->
+                        merged.computeIfAbsent(languageCode.toLowerCase(), key -> new LinkedHashMap<>()).putAll(translations));
+            }
+
+            this.locales = Collections.unmodifiableMap(merged);
+            this.resolved.clear();
+        }
     }
 
     /** Reloads off the calling thread — the point of it is {@link RemoteLocaleSource}, which blocks on HTTP. */
     public CompletableFuture<Void> reloadAsync() {
         return CompletableFuture.runAsync(this::reload);
+    }
+
+    /** {@link #reloadFromDisk()} off the calling thread. */
+    public CompletableFuture<Void> reloadFromDiskAsync() {
+        return CompletableFuture.runAsync(this::reloadFromDisk);
+    }
+
+    /** {@link #reloadFromCloud()} off the calling thread. This is the one you normally want. */
+    public CompletableFuture<Void> reloadFromCloudAsync() {
+        return CompletableFuture.runAsync(this::reloadFromCloud);
     }
 
     /**

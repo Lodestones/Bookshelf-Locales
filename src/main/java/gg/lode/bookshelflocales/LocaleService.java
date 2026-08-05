@@ -63,6 +63,20 @@ public interface LocaleService {
 
     void setDefaultLocale(String languageCode);
 
-    /** Re-reads every source. Safe to call at runtime; readers never see a half-loaded state. */
+    /**
+     * Re-reads every source, network included. Safe to call at runtime; readers never see a
+     * half-loaded state.
+     */
     void reload();
+
+    /**
+     * Re-reads only the local sources (bundled defaults, the server owner's folder, in-memory
+     * locales). Remote sources keep what they last returned, so this stays fast and works offline.
+     */
+    void reloadFromDisk();
+
+    /**
+     * Re-fetches only the remote sources, leaving files on disk alone. Blocks on HTTP.
+     */
+    void reloadFromCloud();
 }

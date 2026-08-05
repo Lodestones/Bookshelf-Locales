@@ -104,6 +104,11 @@ public final class RemoteLocaleSource implements LocaleSource {
         return "remote manifest " + manifestUrl;
     }
 
+    @Override
+    public boolean isRemote() {
+        return true;
+    }
+
     private Map<String, String> fetchManifest(Consumer<String> problems) {
         try {
             JsonElement root = JsonParser.parseString(get(manifestUrl));

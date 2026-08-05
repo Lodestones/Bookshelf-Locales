@@ -77,6 +77,26 @@ own name for itself.
 | `<uppercase>`, `<lowercase>`, `<capitalize>` | Casing, applied before MiniMessage renders |
 | MiniMessage tags | Colors, gradients, hovers — anything Adventure supports |
 
+## Reloading
+
+```java
+locales.reloadFromDisk();   // bundled + folder + in-memory only. Fast, no network, works offline
+locales.reloadFromCloud();  // remote manifest only. Blocks on HTTP
+locales.reload();           // everything
+```
+
+Each has an async twin — `reloadFromDiskAsync()`, `reloadFromCloudAsync()`, `reloadAsync()` — returning
+a `CompletableFuture<Void>`. Use `reloadFromCloudAsync()` from a command handler; never fetch on the
+main thread.
+
+A partial reload keeps what the other sources last returned and re-merges in the configured order, so
+precedence never shifts. If a source suddenly returns nothing — host unreachable with no cache, folder
+emptied — the last good copy is kept and a warning is logged, rather than the plugin dropping to raw
+keys.
+
+For a `/reloadlocales` command, `reloadFromDisk()` is usually what an admin means: they just edited a
+file. Reach for `reloadFromCloud()` after publishing new hosted translations.
+
 ## Hosting your own locales (cloud loader)
 
 Hard-code one manifest URL and ship no locale files at all. New languages and fixed typos then reach
