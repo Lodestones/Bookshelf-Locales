@@ -51,7 +51,35 @@ locale, and then to the raw key itself — a plugin with no locale files at all 
 renders keys.
 
 `exportBundledDefaults(true)` writes your bundled files into the folder when they aren't there yet,
-so owners have something real to edit. Existing files are never overwritten.
+so owners have something real to edit.
+
+## Versioning
+
+Give the bundled file a `locale.version` and bump it whenever you add or correct keys:
+
+```json
+{
+  "locale.version": "2",
+  "myplugin.welcome": "<green>Welcome, <player>!"
+}
+```
+
+On start, an exported file with a lower version is brought up to date by a three-way merge against
+`locales/.defaults/<code>.json`, a snapshot of what was last exported:
+
+| In the owner's file | What happens |
+|---|---|
+| key missing | added |
+| value still equal to the old default | replaced with the new default — nobody chose it |
+| value differs from the old default | kept — somebody did |
+| key you no longer ship | left alone |
+
+That distinction needs the snapshot. Comparing against the *current* default can only say "this
+differs", not whether the owner chose it — so a default that ships wrong, a broken placeholder or a
+typo, could never be corrected without also stamping on real edits. Files exported before the
+snapshot existed fall back to adding missing keys only.
+
+A file whose version already matches is not read past the version check and never rewritten.
 
 ## Reading
 

@@ -3,6 +3,7 @@ package gg.lode.bookshelflocales;
 import gg.lode.bookshelfapi.api.util.MiniMessageHelper;
 import gg.lode.bookshelfapi.api.util.VariableContext;
 import gg.lode.bookshelflocales.source.FolderLocaleSource;
+import gg.lode.bookshelflocales.source.LocaleJson;
 import gg.lode.bookshelflocales.source.LocaleSource;
 import gg.lode.bookshelflocales.source.RemoteLocaleSource;
 import gg.lode.bookshelflocales.source.ResourceLocaleSource;
@@ -11,6 +12,10 @@ import net.kyori.adventure.text.Component;
 import net.kyori.adventure.text.format.TextDecoration;
 
 import java.io.InputStream;
+import java.io.InputStreamReader;
+import java.io.Reader;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.AtomicMoveNotSupportedException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
@@ -57,6 +62,16 @@ public final class LocaleManager implements LocaleService {
     public static final String DISPLAY_NAME_KEY = "locale.display_name";
     /** Key controlling where a locale sorts in {@link #getLocales()}. Lower comes first. */
     public static final String SORT_ORDER_KEY = "locale.sort_order";
+
+    /**
+     * Schema version of a locale file, as a whole number.
+     *
+     * <p>Bump it in the bundled file whenever keys are added. An exported file
+     * carrying a lower version is topped up with the keys it is missing on the
+     * next start; one that matches is left alone entirely. A file with no version
+     * counts as 0, so files written before this existed are upgraded once.
+     */
+    public static final String VERSION_KEY = "locale.version";
 
     /** Nested translations: a value may embed another key as {@code {other.key}}. */
     private static final Pattern KEY_PATTERN = Pattern.compile("\\{(.+?)}");
@@ -200,13 +215,18 @@ public final class LocaleManager implements LocaleService {
             if (!(source instanceof ResourceLocaleSource resourceSource)) continue;
             for (String languageCode : resourceSource.languageCodes()) {
                 Path target = exportFolder.resolve(languageCode.toLowerCase() + ".json");
-                if (Files.exists(target)) continue;
-                try (InputStream stream = resourceSource.open(languageCode)) {
-                    if (stream == null) continue;
-                    Files.copy(stream, target, StandardCopyOption.REPLACE_EXISTING);
-                } catch (Exception e) {
-                    logger.accept("[Locales] Could not write default locale " + languageCode + ": " + e.getMessage());
+                if (!Files.exists(target)) {
+                    try (InputStream stream = resourceSource.open(languageCode)) {
+                        if (stream == null) continue;
+                        Files.copy(stream, target, StandardCopyOption.REPLACE_EXISTING);
+                        Map<String, String> defaults = readBundled(resourceSource, languageCode);
+                        if (defaults != null) writeSnapshot(languageCode, defaults);
+                    } catch (Exception e) {
+                        logger.accept("[Locales] Could not write default locale " + languageCode + ": " + e.getMessage());
+                    }
+                    continue;
                 }
+                topUp(resourceSource, languageCode, target);
             }
         }
     }
@@ -383,6 +403,136 @@ public final class LocaleManager implements LocaleService {
 
         visited.remove(translationKey);
         return TextTransformations.apply(sb.toString().replace("<br>", "\n"));
+    }
+
+
+    /**
+     * Brings a previously exported file up to the bundled {@link #VERSION_KEY}.
+     *
+     * <p>Three-way, against a snapshot of what was last exported:
+     *
+     * <ul>
+     *   <li>key missing from the file - added</li>
+     *   <li>value still identical to the old default - replaced with the new one,
+     *       because nobody chose it</li>
+     *   <li>value differs from the old default - kept, because somebody did</li>
+     * </ul>
+     *
+     * <p>Add-only merging is not enough on its own. A default that ships wrong -
+     * a broken placeholder, a typo - is in every exported file untouched, and
+     * without the snapshot there is no way to tell "they left the default" from
+     * "they chose exactly that", so the fix can never reach them. Keys an owner
+     * added that the plugin does not ship are always left alone.
+     *
+     * <p>With no snapshot - a file exported before snapshots existed - this falls
+     * back to adding missing keys only, which is the safe half.
+     */
+    private void topUp(ResourceLocaleSource source, String languageCode, Path target) {
+        Map<String, String> bundled = readBundled(source, languageCode);
+        if (bundled == null) return;
+        Map<String, String> existing;
+        try (Reader reader = Files.newBufferedReader(target, StandardCharsets.UTF_8)) {
+            existing = LocaleJson.parse(reader);
+        } catch (Exception e) {
+            logger.accept("[Locales] Could not read " + target + ": " + e.getMessage());
+            return;
+        }
+
+        int bundledVersion = version(bundled);
+        if (bundledVersion <= version(existing)) return;
+
+        Map<String, String> snapshot = readSnapshot(languageCode);
+        Map<String, String> merged = new LinkedHashMap<>(existing);
+        int added = 0;
+        int refreshed = 0;
+        for (Map.Entry<String, String> entry : bundled.entrySet()) {
+            String key = entry.getKey();
+            if (VERSION_KEY.equals(key)) continue;   // set once, below - not a translation
+            String current = merged.get(key);
+            if (current == null) {
+                merged.put(key, entry.getValue());
+                added++;
+            } else if (!current.equals(entry.getValue())
+                    && snapshot != null && current.equals(snapshot.get(key))) {
+                merged.put(key, entry.getValue());
+                refreshed++;
+            }
+        }
+        merged.put(VERSION_KEY, Integer.toString(bundledVersion));
+
+        // Write beside the target and move into place, so an interrupted write
+        // cannot leave a server with a half a locale file.
+        Path temp = target.resolveSibling(target.getFileName() + ".tmp");
+        try {
+            Files.writeString(temp, LocaleJson.write(merged), StandardCharsets.UTF_8);
+            try {
+                Files.move(temp, target, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
+            } catch (AtomicMoveNotSupportedException e) {
+                Files.move(temp, target, StandardCopyOption.REPLACE_EXISTING);
+            }
+            writeSnapshot(languageCode, bundled);
+            logger.accept("[Locales] Updated " + target.getFileName() + " to version " + bundledVersion
+                    + " (" + added + " added, " + refreshed + " refreshed, your edits kept)");
+        } catch (Exception e) {
+            logger.accept("[Locales] Could not update " + target + ": " + e.getMessage());
+            try { Files.deleteIfExists(temp); } catch (Exception ignored) { }
+        }
+    }
+
+
+
+    /** The defaults shipped in the jar, or null when they cannot be read. */
+    private Map<String, String> readBundled(ResourceLocaleSource source, String languageCode) {
+        try (InputStream stream = source.open(languageCode)) {
+            if (stream == null) return null;
+            try (Reader reader = new InputStreamReader(stream, StandardCharsets.UTF_8)) {
+                return LocaleJson.parse(reader);
+            }
+        } catch (Exception e) {
+            logger.accept("[Locales] Could not read bundled " + languageCode + ": " + e.getMessage());
+            return null;
+        }
+    }
+
+    /** Where the last exported defaults are remembered, so edits can be told from leftovers. */
+    private Path snapshotPath(String languageCode) {
+        return exportFolder.resolve(".defaults").resolve(languageCode.toLowerCase() + ".json");
+    }
+
+    /** The defaults as they were last written out, or null when that is not known. */
+    private Map<String, String> readSnapshot(String languageCode) {
+        Path path = snapshotPath(languageCode);
+        if (!Files.exists(path)) return null;
+        try (Reader reader = Files.newBufferedReader(path, StandardCharsets.UTF_8)) {
+            return LocaleJson.parse(reader);
+        } catch (Exception e) {
+            logger.accept("[Locales] Could not read " + path + ": " + e.getMessage());
+            return null;
+        }
+    }
+
+    /**
+     * Records the defaults just exported. Losing this is not fatal - the next
+     * upgrade simply falls back to adding keys - so a failure is logged and the
+     * export still counts as done.
+     */
+    private void writeSnapshot(String languageCode, Map<String, String> bundled) {
+        Path path = snapshotPath(languageCode);
+        try {
+            Files.createDirectories(path.getParent());
+            Files.writeString(path, LocaleJson.write(bundled), StandardCharsets.UTF_8);
+        } catch (Exception e) {
+            logger.accept("[Locales] Could not record defaults for " + languageCode + ": " + e.getMessage());
+        }
+    }
+
+    /** A file with no version, or an unreadable one, counts as 0. */
+    private static int version(Map<String, String> translations) {
+        try {
+            return Integer.parseInt(translations.getOrDefault(VERSION_KEY, "0").trim());
+        } catch (NumberFormatException e) {
+            return 0;
+        }
     }
 
     // ------------------------------------------------------------------ builder
