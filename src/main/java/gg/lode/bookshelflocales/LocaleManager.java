@@ -3,6 +3,8 @@ package gg.lode.bookshelflocales;
 import gg.lode.bookshelfapi.api.util.MiniMessageHelper;
 import gg.lode.bookshelfapi.api.util.VariableContext;
 import gg.lode.bookshelflocales.source.FolderLocaleSource;
+import gg.lode.bookshelflocales.migration.LocaleEdit;
+import gg.lode.bookshelflocales.migration.LocaleMigration;
 import gg.lode.bookshelflocales.source.LocaleJson;
 import gg.lode.bookshelflocales.source.LocaleSource;
 import gg.lode.bookshelflocales.source.RemoteLocaleSource;
@@ -29,6 +31,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.TreeMap;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.function.Consumer;
@@ -80,6 +83,8 @@ public final class LocaleManager implements LocaleService {
     private final Consumer<String> logger;
     private final Path exportFolder;
     private final boolean exportBundledDefaults;
+    /** Steps to run on the way up, keyed by the version each one arrives at. */
+    private final Map<Integer, List<LocaleMigration>> migrations;
 
     /** Loaded translations, replaced wholesale on reload so a reader never sees a half-built map. */
     private volatile Map<String, Map<String, String>> locales = Map.of();
@@ -101,6 +106,7 @@ public final class LocaleManager implements LocaleService {
         this.defaultLocale = builder.defaultLocale.toLowerCase();
         this.exportFolder = builder.exportFolder;
         this.exportBundledDefaults = builder.exportBundledDefaults;
+        this.migrations = new TreeMap<>(builder.migrations);
 
         reload();
     }
@@ -439,9 +445,34 @@ public final class LocaleManager implements LocaleService {
         }
 
         int bundledVersion = version(bundled);
-        if (bundledVersion <= version(existing)) return;
+        int existingVersion = version(existing);
+        if (bundledVersion <= existingVersion) {
+            warnIfUnbumped(target, bundled, existing, bundledVersion);
+            return;
+        }
 
         Map<String, String> snapshot = readSnapshot(languageCode);
+
+        // Step up one version at a time, the way a config migration does, so a file
+        // that skipped releases takes the same route as one that did not. Each step
+        // runs over the owner's file and the recorded defaults together - migrate
+        // only one and a value nobody touched stops matching the other, and the
+        // merge below would then guard it forever as an edit.
+        int steps = 0;
+        for (int v = existingVersion + 1; v <= bundledVersion; v++) {
+            List<LocaleMigration> forVersion = migrations.get(v);
+            if (forVersion == null) continue;
+            for (LocaleMigration migration : forVersion) {
+                try {
+                    migration.apply(new LocaleEdit(existing));
+                    if (snapshot != null) migration.apply(new LocaleEdit(snapshot));
+                    steps++;
+                } catch (Exception e) {
+                    logger.accept("[Locales] Migration to version " + v + " failed for "
+                            + target.getFileName() + ": " + e.getMessage());
+                }
+            }
+        }
         Map<String, String> merged = new LinkedHashMap<>(existing);
         int added = 0;
         int refreshed = 0;
@@ -471,8 +502,10 @@ public final class LocaleManager implements LocaleService {
                 Files.move(temp, target, StandardCopyOption.REPLACE_EXISTING);
             }
             writeSnapshot(languageCode, bundled);
-            logger.accept("[Locales] Updated " + target.getFileName() + " to version " + bundledVersion
-                    + " (" + added + " added, " + refreshed + " refreshed, your edits kept)");
+            logger.accept("[Locales] Updated " + target.getFileName() + " " + existingVersion + " -> " + bundledVersion
+                    + " (" + added + " added, " + refreshed + " refreshed"
+                    + (steps == 0 ? "" : ", " + steps + " migration" + (steps == 1 ? "" : "s"))
+                    + ", your edits kept)");
         } catch (Exception e) {
             logger.accept("[Locales] Could not update " + target + ": " + e.getMessage());
             try { Files.deleteIfExists(temp); } catch (Exception ignored) { }
@@ -480,6 +513,27 @@ public final class LocaleManager implements LocaleService {
     }
 
 
+
+
+    /**
+     * Says so when the bundle carries keys an exported file has not got but the
+     * versions match, which means the author added them and forgot to bump
+     * {@link #VERSION_KEY}. Nothing else reports this: the file is simply skipped,
+     * the new messages never reach anyone, and the plugin renders raw keys.
+     */
+    private void warnIfUnbumped(Path target, Map<String, String> bundled, Map<String, String> existing, int version) {
+        List<String> missing = new ArrayList<>();
+        for (String key : bundled.keySet()) {
+            if (!key.startsWith("locale.") && !existing.containsKey(key)) missing.add(key);
+        }
+        if (missing.isEmpty()) return;
+        Collections.sort(missing);
+        String sample = String.join(", ", missing.subList(0, Math.min(3, missing.size())));
+        logger.accept("[Locales] " + target.getFileName() + " is missing " + missing.size()
+                + " key(s) the plugin ships (" + sample + (missing.size() > 3 ? ", ..." : "")
+                + ") but both are at version " + version
+                + " - bump " + VERSION_KEY + " in the bundled file so they are merged in.");
+    }
 
     /** The defaults shipped in the jar, or null when they cannot be read. */
     private Map<String, String> readBundled(ResourceLocaleSource source, String languageCode) {
@@ -545,6 +599,7 @@ public final class LocaleManager implements LocaleService {
         };
         private Path exportFolder;
         private boolean exportBundledDefaults;
+        private final Map<Integer, List<LocaleMigration>> migrations = new TreeMap<>();
 
         private Builder() {
         }
@@ -604,6 +659,23 @@ public final class LocaleManager implements LocaleService {
          */
         public Builder exportBundledDefaults(boolean exportBundledDefaults) {
             this.exportBundledDefaults = exportBundledDefaults;
+            return this;
+        }
+
+        /**
+         * Registers a step to run when a locale file climbs to {@code version}.
+         *
+         * <p>Same shape as a config migration: a file two versions behind runs each
+         * step in turn rather than jumping. Use this for changes the default merge
+         * cannot express - renaming a key while keeping the owner's wording, or
+         * rewriting syntax inside values they wrote themselves. Adding a key or
+         * correcting a default needs nothing here; bumping the version is enough.
+         *
+         * <p>Several steps may share a version and run in the order registered.
+         */
+        public Builder migration(int version, LocaleMigration migration) {
+            if (version < 1) throw new IllegalArgumentException("locale versions start at 1, got " + version);
+            migrations.computeIfAbsent(version, v -> new ArrayList<>()).add(migration);
             return this;
         }
 

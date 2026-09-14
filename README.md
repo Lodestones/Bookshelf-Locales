@@ -79,7 +79,28 @@ differs", not whether the owner chose it — so a default that ships wrong, a br
 typo, could never be corrected without also stamping on real edits. Files exported before the
 snapshot existed fall back to adding missing keys only.
 
-A file whose version already matches is not read past the version check and never rewritten.
+A file whose version already matches is not read past the version check and never rewritten — though if the
+bundle carries keys that file hasn't got, you get a warning, because that means the version wasn't bumped and
+those messages would silently never arrive.
+
+## Migrations
+
+The merge can add a key, refresh a default nobody touched, and keep an edit. It cannot rename a key or rewrite
+what's *inside* an edit. Register a step for those, keyed by the version it arrives at:
+
+```java
+LocaleManager.builder()
+        .migration(2, l -> l.replaceInValues("\\{([a-zA-Z0-9_]+)}", "<$1>"))  // placeholder syntax changed
+        .migration(3, l -> l.rename("old.key", "new.key"))                  // key renamed, wording rides along
+```
+
+A file at 1 upgrading to 3 runs step 2 and then step 3, so a server that skipped a release arrives the same way
+one that didn't does — the same shape as a config migration. Steps run *before* the merge, and each runs over
+the owner's file **and** the recorded defaults. Migrating both is the point: a value nobody touched has to still
+match the snapshot once both are rewritten, or the merge would read it as an edit and guard it forever.
+
+`LocaleEdit` offers `rename`, `remove`, `set`, `replaceInValues`, `editValues`, and the raw map. Adding a key or
+correcting a default needs no migration — bumping the version is enough.
 
 ## Reading
 
