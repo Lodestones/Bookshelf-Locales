@@ -6,7 +6,7 @@
 
     <groupId>gg.lode</groupId>
     <artifactId>Bookshelf-Locales</artifactId>
-    <version>1.1.1</version>
+    <version>1.2.0</version>
     <packaging>jar</packaging>
 
     <name>Bookshelf-Locales</name>
@@ -52,11 +52,18 @@
     </repositories>
 
     <dependencies>
+        <!-- Only for LanguagePicker, the one Paper-specific class. Velocity consumers never load it. -->
+        <dependency>
+            <groupId>io.papermc.paper</groupId>
+            <artifactId>paper-api</artifactId>
+            <version>1.21.4-R0.1-SNAPSHOT</version>
+            <scope>provided</scope>
+        </dependency>
         <!-- VariableContext + MiniMessageHelper. Provided: every consumer already ships Bookshelf-API. -->
         <dependency>
             <groupId>com.github.Lodestones</groupId>
             <artifactId>Bookshelf-API</artifactId>
-            <version>1.2.44</version>
+            <version>1.2.48</version>
             <scope>provided</scope>
         </dependency>
         <!-- Paper and Velocity both ship adventure and gson on the server classpath. -->

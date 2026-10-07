@@ -12,6 +12,7 @@ import gg.lode.bookshelflocales.source.ResourceLocaleSource;
 import gg.lode.bookshelflocales.text.TextTransformations;
 import net.kyori.adventure.text.Component;
 import net.kyori.adventure.text.format.TextDecoration;
+import org.jetbrains.annotations.Nullable;
 
 import java.io.InputStream;
 import java.io.InputStreamReader;
@@ -65,6 +66,11 @@ public final class LocaleManager implements LocaleService {
     public static final String DISPLAY_NAME_KEY = "locale.display_name";
     /** Key controlling where a locale sorts in {@link #getLocales()}. Lower comes first. */
     public static final String SORT_ORDER_KEY = "locale.sort_order";
+    /**
+     * Key holding a locale's flag head, as a skin texture hash. Optional: common languages fall
+     * back to {@link LocaleFlags}.
+     */
+    public static final String HEAD_KEY = "locale.head";
 
     /**
      * Schema version of a locale file, as a whole number.
@@ -337,6 +343,17 @@ public final class LocaleManager implements LocaleService {
         Map<String, String> translations = locales.get(languageCode.toLowerCase());
         if (translations == null) return languageCode;
         return translations.getOrDefault(DISPLAY_NAME_KEY, languageCode);
+    }
+
+    /**
+     * The flag head texture hash for a locale: its own {@code locale.head} if it sets one,
+     * otherwise the default for that language, or null when there's neither.
+     */
+    public @Nullable String getHead(String languageCode) {
+        if (languageCode == null) return null;
+        Map<String, String> translations = locales.get(languageCode.toLowerCase());
+        String own = translations == null ? null : translations.get(HEAD_KEY);
+        return own != null && !own.isBlank() ? own : LocaleFlags.forLocale(languageCode);
     }
 
     @Override
