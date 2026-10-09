@@ -45,6 +45,7 @@ public final class RemoteLocaleSource implements LocaleSource {
     private final Map<String, String> headers = new LinkedHashMap<>();
     private Duration timeout = DEFAULT_TIMEOUT;
     private Path cacheFolder;
+    private boolean background;
     private HttpClient client;
 
     public RemoteLocaleSource(String manifestUrl) {
@@ -70,6 +71,24 @@ public final class RemoteLocaleSource implements LocaleSource {
     public RemoteLocaleSource cacheFolder(Path cacheFolder) {
         this.cacheFolder = cacheFolder;
         return this;
+    }
+
+    /**
+     * Leaves this source out of the load that runs while the manager is built, and fetches it right
+     * after on another thread instead. Startup then never waits on the host; until the fetch lands,
+     * the bundled defaults are what players see.
+     */
+    public RemoteLocaleSource background(boolean background) {
+        this.background = background;
+        return this;
+    }
+
+    public boolean isBackground() {
+        return background;
+    }
+
+    public boolean hasCacheFolder() {
+        return cacheFolder != null;
     }
 
     public String manifestUrl() {

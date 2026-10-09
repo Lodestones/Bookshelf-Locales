@@ -114,7 +114,30 @@ public final class LocaleManager implements LocaleService {
         this.exportBundledDefaults = builder.exportBundledDefaults;
         this.migrations = new TreeMap<>(builder.migrations);
 
+        for (LocaleSource source : sources) {
+            // A GitHub source caches next to the owner's folder unless told otherwise, so an outage
+            // serves the last good copy rather than nothing.
+            if (source instanceof RemoteLocaleSource remote && !remote.hasCacheFolder() && exportFolder != null) {
+                remote.cacheFolder(exportFolder.resolve(".cloud"));
+            }
+        }
+
         reload();
+    }
+
+    private static boolean isBackground(LocaleSource source) {
+        return source instanceof RemoteLocaleSource remote && remote.isBackground();
+    }
+
+    private void reload(Predicate<LocaleSource> filter, boolean async) {
+        if (!async) {
+            reload(filter);
+            return;
+        }
+        CompletableFuture.runAsync(() -> reload(filter)).exceptionally(e -> {
+            logger.accept("[Locales] Background locale fetch failed: " + e.getMessage());
+            return null;
+        });
     }
 
     public static Builder builder() {
@@ -123,9 +146,19 @@ public final class LocaleManager implements LocaleService {
 
     // ------------------------------------------------------------------ loading
 
+    /**
+     * Re-reads every source. A {@link Builder#github GitHub} source, or any remote set to
+     * {@link RemoteLocaleSource#background(boolean) background}, is fetched on another thread so this
+     * never waits on the network; everything else is current when it returns.
+     */
     @Override
     public void reload() {
-        reload(source -> true);
+        if (sources.stream().noneMatch(LocaleManager::isBackground)) {
+            reload(source -> true);
+            return;
+        }
+        reload(source -> !isBackground(source));
+        reload(LocaleManager::isBackground, true);
     }
 
     /**
@@ -662,12 +695,25 @@ public final class LocaleManager implements LocaleService {
         }
 
         /**
+         * Locales from a public GitHub repo, so translations can be contributed by pull request and
+         * reach servers without a plugin update. Reads {@code <folder>/manifest.json} on the repo's
+         * {@code main} branch, fetched in the background and cached beside the owner's folder.
+         *
+         * @param repository {@code owner/name}, e.g. {@code Lodestones/Locales}
+         * @param folder     the plugin's folder in it, e.g. {@code barrier}
+         */
+        public Builder github(String repository, String folder) {
+            return remote("https://raw.githubusercontent.com/" + repository + "/main/" + folder + "/manifest.json",
+                    source -> source.background(true));
+        }
+
+        /**
          * The server owner's folder of {@code *.json} locales. Also the folder bundled defaults are
          * exported into when {@link #exportBundledDefaults(boolean)} is on.
          */
         public Builder folder(Path folder) {
             this.exportFolder = folder;
-            return source(new FolderLocaleSource(folder));
+            return source(new FolderLocaleSource(folder, folder.resolve(".defaults")));
         }
 
         /**
