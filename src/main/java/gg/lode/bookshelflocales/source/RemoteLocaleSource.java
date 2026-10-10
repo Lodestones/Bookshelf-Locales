@@ -4,6 +4,7 @@ import com.google.gson.JsonElement;
 import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
 
+import java.io.IOException;
 import java.io.StringReader;
 import java.net.URI;
 import java.net.http.HttpClient;
@@ -14,6 +15,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
 import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.Map;
 import java.util.function.Consumer;
 
@@ -40,6 +42,8 @@ import java.util.function.Consumer;
 public final class RemoteLocaleSource implements LocaleSource {
 
     private static final Duration DEFAULT_TIMEOUT = Duration.ofSeconds(10);
+    private static final int ATTEMPTS = 3;
+    private static final long RETRY_DELAY_MS = 500;
 
     private final String manifestUrl;
     private final Map<String, String> headers = new LinkedHashMap<>();
@@ -95,27 +99,66 @@ public final class RemoteLocaleSource implements LocaleSource {
         return manifestUrl;
     }
 
+    /**
+     * Never throws and never fails the load. A host that can't be reached costs one warning
+     * naming what fell back, and the cached or bundled text carries on in its place.
+     */
     @Override
     public Map<String, Map<String, String>> load(Consumer<String> problems) {
-        Map<String, String> manifest = fetchManifest(problems);
-        if (manifest == null) return loadCache(problems, "manifest could not be fetched");
+        Map<String, String> manifest;
+        try {
+            manifest = fetchManifest(problems);
+        } catch (Exception e) {
+            boolean cached = cacheFolder != null && Files.isDirectory(cacheFolder);
+            problems.accept("Couldn't reach " + host() + " for translation updates (" + reason(e) + "). "
+                    + (cached ? "Using the last downloaded copy." : "Using the built-in text."));
+            return cached ? new FolderLocaleSource(cacheFolder).load(problems) : new LinkedHashMap<>();
+        }
+        if (manifest == null) return loadCache(problems, "the manifest isn't readable");
 
         Map<String, Map<String, String>> loaded = new LinkedHashMap<>();
+        Map<String, String> fromCache = new LinkedHashMap<>();
+        Map<String, String> builtIn = new LinkedHashMap<>();
         for (Map.Entry<String, String> entry : manifest.entrySet()) {
             String languageCode = entry.getKey().toLowerCase();
-            String url = resolve(entry.getValue());
             try {
-                String body = get(url);
-                Map<String, String> translations = LocaleJson.parse(new StringReader(body));
+                Map<String, String> translations = LocaleJson.parse(new StringReader(get(resolve(entry.getValue()))));
                 loaded.put(languageCode, translations);
                 writeCache(languageCode, translations, problems);
             } catch (Exception e) {
-                problems.accept("Could not fetch locale " + languageCode + " from " + url + ": " + reason(e));
                 Map<String, String> cached = readCache(languageCode, problems);
-                if (cached != null) loaded.put(languageCode, cached);
+                if (cached != null) {
+                    loaded.put(languageCode, cached);
+                    fromCache.put(languageCode, reason(e));
+                } else {
+                    builtIn.put(languageCode, reason(e));
+                }
             }
         }
+        if (!fromCache.isEmpty()) {
+            problems.accept("Couldn't download " + describe(fromCache) + " from " + host() + ". Using the last downloaded copy.");
+        }
+        if (!builtIn.isEmpty()) {
+            problems.accept("Couldn't download " + describe(builtIn) + " from " + host() + ". Using the built-in text until the next reload.");
+        }
         return loaded;
+    }
+
+    /** {@code pl_pl (Connection reset)}, or {@code 3 languages (pl_pl, ru_ru, tr_tr: Connection reset)}. */
+    private static String describe(Map<String, String> failures) {
+        String codes = String.join(", ", failures.keySet());
+        String reasons = String.join("; ", new LinkedHashSet<>(failures.values()));
+        return failures.size() == 1 ? codes + " (" + reasons + ")"
+                : failures.size() + " languages (" + codes + ": " + reasons + ")";
+    }
+
+    private String host() {
+        try {
+            String host = URI.create(manifestUrl).getHost();
+            return host == null ? manifestUrl : host;
+        } catch (Exception e) {
+            return manifestUrl;
+        }
     }
 
     @Override
@@ -128,9 +171,11 @@ public final class RemoteLocaleSource implements LocaleSource {
         return true;
     }
 
-    private Map<String, String> fetchManifest(Consumer<String> problems) {
+    /** Null when the manifest arrived but can't be used; throws when it couldn't be fetched. */
+    private Map<String, String> fetchManifest(Consumer<String> problems) throws Exception {
+        String body = get(manifestUrl);
         try {
-            JsonElement root = JsonParser.parseString(get(manifestUrl));
+            JsonElement root = JsonParser.parseString(body);
             if (root == null || !root.isJsonObject()) {
                 problems.accept("Locale manifest at " + manifestUrl + " is not a JSON object of code -> url");
                 return null;
@@ -146,7 +191,7 @@ public final class RemoteLocaleSource implements LocaleSource {
             }
             return manifest;
         } catch (Exception e) {
-            problems.accept("Could not fetch locale manifest " + manifestUrl + ": " + reason(e));
+            problems.accept("Locale manifest at " + manifestUrl + " isn't valid JSON: " + reason(e));
             return null;
         }
     }
@@ -157,16 +202,31 @@ public final class RemoteLocaleSource implements LocaleSource {
         return message == null || message.isBlank() ? e.getClass().getSimpleName() : message;
     }
 
+    /**
+     * One GET, tried up to {@link #ATTEMPTS} times. A dropped connection, a timeout, a 429 or a
+     * 5xx is usually gone a moment later, and one bad response shouldn't cost a language.
+     */
     private String get(String url) throws Exception {
-        HttpRequest.Builder request = HttpRequest.newBuilder(URI.create(url))
-                .timeout(timeout)
-                .header("Accept", "application/json")
-                .GET();
-        headers.forEach(request::header);
+        Exception last = null;
+        for (int attempt = 1; attempt <= ATTEMPTS; attempt++) {
+            try {
+                HttpRequest.Builder request = HttpRequest.newBuilder(URI.create(url))
+                        .timeout(timeout)
+                        .header("Accept", "application/json")
+                        .GET();
+                headers.forEach(request::header);
 
-        HttpResponse<String> response = client().send(request.build(), HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
-        if (response.statusCode() / 100 != 2) throw new IllegalStateException("HTTP " + response.statusCode());
-        return response.body();
+                HttpResponse<String> response = client().send(request.build(), HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
+                int status = response.statusCode();
+                if (status / 100 == 2) return response.body();
+                last = new IllegalStateException("HTTP " + status);
+                if (status != 429 && status / 100 != 5) throw last;
+            } catch (IOException e) {
+                last = e;
+            }
+            if (attempt < ATTEMPTS) Thread.sleep(RETRY_DELAY_MS * attempt);
+        }
+        throw last;
     }
 
     private HttpClient client() {
@@ -190,7 +250,7 @@ public final class RemoteLocaleSource implements LocaleSource {
 
     private Map<String, Map<String, String>> loadCache(Consumer<String> problems, String reason) {
         if (cacheFolder == null || !Files.isDirectory(cacheFolder)) return new LinkedHashMap<>();
-        problems.accept("Serving cached remote locales (" + reason + ")");
+        problems.accept("Couldn't use the translation updates from " + host() + " (" + reason + "). Using the last downloaded copy.");
         return new FolderLocaleSource(cacheFolder).load(problems);
     }
 
